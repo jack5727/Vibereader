@@ -1,0 +1,16 @@
+# 虛擬環境
+.venv/
+
+# 環境變數
+.env
+
+# Python 快取
+__pycache__/
+
+# 本機 log
+usage_log.jsonl
+error_log.txt
+
+# 測試檔
+test1.py
+profile.txt

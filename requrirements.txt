@@ -1,0 +1,6 @@
+flask
+requests
+python-dotenv
+youtube-transcript-api
+openai
+gunicorn
