@@ -4,3 +4,4 @@ python-dotenv==1.2.1
 youtube-transcript-api==0.6.2
 openai==2.21.0
 gunicorn==23.0.0
+yt-dlp

@@ -31,6 +31,9 @@ from openai import OpenAI
 import random
 import queue
 from youtube_transcript_api._errors import YouTubeRequestFailed
+import subprocess
+import tempfile
+
 
 load_dotenv()
 
@@ -233,8 +236,147 @@ def extract_video_id(url: str) -> str:
 
     raise ValueError("這不是有效的 YouTube 影片連結（找不到 videoId），請貼完整網址")
 
+def fetch_transcript_via_ytdlp(video_id: str) -> str:
+    """
+    Fallback: use yt-dlp to download subtitles (auto/manual) and return text.
+    Works better on some environments where youtube_transcript_api is blocked.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    with tempfile.TemporaryDirectory() as td:
+        # 下載字幕（優先手動，其次自動），不要下載影片
+        # 產出格式通常會是 .vtt
+        cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-lang", "zh-Hant,zh-TW,zh-HK,zh,zh-Hans,en",
+            "--sub-format", "vtt",
+            "-o", os.path.join(td, "%(id)s.%(ext)s"),
+            url,
+        ]
+
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError(f"yt-dlp failed: {r.stderr[:500]}")
+
+        # 找到 vtt 檔
+        vtts = []
+        for fn in os.listdir(td):
+            if fn.startswith(video_id) and fn.endswith(".vtt"):
+                vtts.append(os.path.join(td, fn))
+
+        if not vtts:
+            raise RuntimeError("yt-dlp: no subtitle file found")
+
+        # 取第一個 vtt（通常就是最符合語言排序的）
+        vtt_path = sorted(vtts)[0]
+
+        # 簡單把 vtt 轉純文字（移除時間軸/標記）
+        lines = []
+        with open(vtt_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # 跳過 WEBVTT header / timestamp
+                if line.startswith("WEBVTT"):
+                    continue
+                if "-->" in line:
+                    continue
+                # 去掉可能的標籤
+                line = re.sub(r"<[^>]+>", "", line).strip()
+                if line:
+                    lines.append(line)
+
+        return "\n".join(lines).strip()
 
 def fetch_cc_transcript_text(video_id: str) -> str:
+    """
+    Fetch YouTube transcript with:
+    - in-memory cache
+    - concurrency limit (semaphore)
+    - exponential backoff retry for 429/sorry
+    - fallback to yt-dlp when blocked
+    """
+
+    def _is_rate_limited(err: Exception) -> bool:
+        s = (str(err) or "").lower()
+        return ("too many requests" in s) or ("google.com/sorry" in s) or ("429" in s)
+
+    def _fetch_via_ytdlp(vid: str) -> str:
+        """
+        Fallback: use yt-dlp to download subtitles (manual/auto) and convert to plain text.
+        """
+        url = f"https://www.youtube.com/watch?v={vid}"
+
+        with tempfile.TemporaryDirectory() as td:
+            # 下載字幕（不下載影片），優先中文各種，再英文
+            # 實務上 yt-dlp 產出的檔名可能包含語言碼，例如:
+            # <id>.zh-Hant.vtt / <id>.en.vtt 等
+            cmd = [
+                "yt-dlp",
+                "--skip-download",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-lang",
+                "zh-Hant,zh-TW,zh-HK,zh,zh-Hans,en",
+                "--sub-format",
+                "vtt",
+                "-o",
+                os.path.join(td, "%(id)s.%(ext)s"),
+                url,
+            ]
+
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if r.returncode != 0:
+                raise RuntimeError(f"yt-dlp failed: {r.stderr[:800]}")
+
+            # 找出所有 vtt 檔（可能有多語言、多種字幕來源）
+            vtt_files = []
+            for fn in os.listdir(td):
+                if fn.startswith(vid) and fn.endswith(".vtt"):
+                    vtt_files.append(os.path.join(td, fn))
+
+            if not vtt_files:
+                raise RuntimeError("yt-dlp: no subtitle (.vtt) file found")
+
+            # 簡單偏好排序：中文優先，再英文
+            # 你也可以依需求調整排序關鍵字
+            def _score(path: str) -> int:
+                name = os.path.basename(path).lower()
+                if "zh-hant" in name or "zh-tw" in name or "zh-hk" in name:
+                    return 0
+                if "zh-hans" in name or "zh" in name:
+                    return 1
+                if ".en." in name or name.endswith(".en.vtt"):
+                    return 2
+                return 9
+
+            vtt_path = sorted(vtt_files, key=_score)[0]
+
+            # VTT -> 純文字（去掉時間軸、header、tag）
+            lines: List[str] = []
+            with open(vtt_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("WEBVTT"):
+                        continue
+                    if "-->" in line:  # timestamp
+                        continue
+                    # 去掉可能的標籤
+                    line = re.sub(r"<[^>]+>", "", line).strip()
+                    if line:
+                        lines.append(line)
+
+            text = "\n".join(lines).strip()
+            if not text:
+                raise RuntimeError("yt-dlp: subtitle file exists but parsed text is empty")
+            return text
+
     # 1) cache hit
     now = time.time()
     cached = TRANSCRIPT_CACHE.get(video_id)
@@ -252,10 +394,10 @@ def fetch_cc_transcript_text(video_id: str) -> str:
             if time.time() - ts < CACHE_TTL_SEC and text:
                 return text
 
-        # 3) retry with exponential backoff + jitter (針對 429 / sorry / 5xx 特別有效)
+        # 3) retry with exponential backoff + jitter
         max_attempts = int(os.getenv("YT_TRANSCRIPT_MAX_ATTEMPTS", "6"))
         base_sleep = float(os.getenv("YT_TRANSCRIPT_BASE_SLEEP", "1.2"))
-        last_err = None
+        last_err: Exception | None = None
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -291,7 +433,10 @@ def fetch_cc_transcript_text(video_id: str) -> str:
                     t = (item.get("text") or "").strip()
                     if t:
                         lines.append(t)
-                text = "\n".join(lines)
+                text = "\n".join(lines).strip()
+
+                if not text:
+                    raise RuntimeError("Transcript fetched but empty")
 
                 # cache store
                 TRANSCRIPT_CACHE[video_id] = (time.time(), text)
@@ -299,26 +444,37 @@ def fetch_cc_transcript_text(video_id: str) -> str:
 
             except Exception as e:
                 last_err = e
-                err_str = str(e).lower()
 
-                # 判斷是否是 YouTube/Google 限流類型（429 / sorry / too many requests）
-                is_rate_limited = (
-                    "too many requests" in err_str
-                    or "google.com/sorry" in err_str
-                    or "429" in err_str
-                )
+                # 如果是限流 / sorry，最後一次前也照常 backoff
+                if _is_rate_limited(e):
+                    sleep_s = min(60.0, base_sleep * (2 ** (attempt - 1)))
+                    sleep_s = sleep_s * (0.7 + random.random() * 0.6)
+                    print(f"[yt_transcript] attempt {attempt}/{max_attempts} failed; sleep {sleep_s:.1f}s; err={e}")
+                    time.sleep(sleep_s)
+                    continue
 
-                # 不是限流：就不要一直重試（例如影片沒字幕、被關閉）
-                if not is_rate_limited and attempt >= 2:
+                # 非限流錯誤（例如沒字幕）通常重試也沒用：最多試 1~2 次就停
+                if attempt >= 2:
                     break
 
-                # backoff with jitter
-                sleep_s = min(60.0, base_sleep * (2 ** (attempt - 1)))
-                sleep_s = sleep_s * (0.7 + random.random() * 0.6)  # 0.7~1.3x
-                print(f"[yt_transcript] attempt {attempt}/{max_attempts} failed; sleep {sleep_s:.1f}s; err={e}")
+                sleep_s = min(5.0, base_sleep * (0.7 + random.random() * 0.6))
+                print(f"[yt_transcript] attempt {attempt}/{max_attempts} failed (non-rate-limit); sleep {sleep_s:.1f}s; err={e}")
                 time.sleep(sleep_s)
 
+        # 4) fallback to yt-dlp when blocked
+        if last_err and _is_rate_limited(last_err):
+            try:
+                print("[yt_transcript] falling back to yt-dlp...")
+                text = _fetch_via_ytdlp(video_id)
+                TRANSCRIPT_CACHE[video_id] = (time.time(), text)
+                return text
+            except Exception as e2:
+                # 保留兩邊錯誤資訊，方便排查
+                raise RuntimeError(f"Transcript blocked (429/sorry) and yt-dlp fallback failed: {e2}") from last_err
+
+        # 5) give up
         raise last_err if last_err else RuntimeError("Transcript fetch failed")
+
 
 
 
