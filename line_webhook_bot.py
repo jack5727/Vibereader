@@ -217,16 +217,44 @@ def extract_video_id(url: str) -> str:
 
 
 def fetch_cc_transcript_text(video_id: str) -> str:
-    data = YouTubeTranscriptApi.get_transcript(
-        video_id,
-        languages=["zh-Hant", "zh-TW", "zh-HK", "zh", "zh-Hans", "en"]
-    )
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+    preferred_langs = ["zh-Hant", "zh-TW", "zh-HK", "zh", "zh-Hans", "en"]
+
+    transcript = None
+
+    for lang in preferred_langs:
+        try:
+            transcript = transcript_list.find_manually_created_transcript([lang])
+            break
+        except Exception:
+            pass
+
+    if transcript is None:
+        for lang in preferred_langs:
+            try:
+                transcript = transcript_list.find_generated_transcript([lang])
+                break
+            except Exception:
+                pass
+
+    if transcript is None:
+        transcript = next(iter(transcript_list), None)
+        if transcript is None:
+            raise RuntimeError("No transcripts available")
+
+    data = transcript.fetch()
+
     lines = []
     for item in data:
         t = (item.get("text") or "").strip()
         if t:
             lines.append(t)
+
     return "\n".join(lines)
+
 
 
 def compress_transcript(text: str, max_chars: int = 200000) -> str:
