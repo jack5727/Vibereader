@@ -28,12 +28,30 @@ from flask import Flask, request, abort
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
 from openai import OpenAI
+import random
+import queue
+from youtube_transcript_api._errors import YouTubeRequestFailed
 
+load_dotenv()
 
+# 同一時間最多幾個 transcript 抓取（建議 1~2）
+TRANSCRIPT_SEM = threading.Semaphore(int(os.getenv("TRANSCRIPT_CONCURRENCY", "1")))
+
+# 針對 YouTube transcript 做快取（記憶體版，部署在單一 Render instance 很有用）
+TRANSCRIPT_CACHE: Dict[str, Tuple[float, str]] = {}  # video_id -> (ts, text)
+CACHE_TTL_SEC = int(os.getenv("TRANSCRIPT_CACHE_TTL_SEC", "86400"))  # 1 day
+
+# -----------------------------
+# Background job queue (避免 thread 暴衝)
+# -----------------------------
+JOB_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=int(os.getenv("JOB_QUEUE_MAXSIZE", "200")))
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", "1"))  # 建議 1~2（先 1 最穩）
+WORKERS_STARTED = False
+WORKERS_LOCK = threading.Lock()
 # -----------------------------
 # Load env
 # -----------------------------
-load_dotenv()
+
 
 LINE_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
 LINE_CHANNEL_SECRET = (os.getenv("LINE_CHANNEL_SECRET") or "").strip()  # optional
@@ -217,43 +235,91 @@ def extract_video_id(url: str) -> str:
 
 
 def fetch_cc_transcript_text(video_id: str) -> str:
-    from youtube_transcript_api import YouTubeTranscriptApi
+    # 1) cache hit
+    now = time.time()
+    cached = TRANSCRIPT_CACHE.get(video_id)
+    if cached:
+        ts, text = cached
+        if now - ts < CACHE_TTL_SEC and text:
+            return text
 
-    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    # 2) concurrency guard
+    with TRANSCRIPT_SEM:
+        # Double-check cache (避免等待 semaphore 後又重抓)
+        cached = TRANSCRIPT_CACHE.get(video_id)
+        if cached:
+            ts, text = cached
+            if time.time() - ts < CACHE_TTL_SEC and text:
+                return text
 
-    preferred_langs = ["zh-Hant", "zh-TW", "zh-HK", "zh", "zh-Hans", "en"]
+        # 3) retry with exponential backoff + jitter (針對 429 / sorry / 5xx 特別有效)
+        max_attempts = int(os.getenv("YT_TRANSCRIPT_MAX_ATTEMPTS", "6"))
+        base_sleep = float(os.getenv("YT_TRANSCRIPT_BASE_SLEEP", "1.2"))
+        last_err = None
 
-    transcript = None
-
-    for lang in preferred_langs:
-        try:
-            transcript = transcript_list.find_manually_created_transcript([lang])
-            break
-        except Exception:
-            pass
-
-    if transcript is None:
-        for lang in preferred_langs:
+        for attempt in range(1, max_attempts + 1):
             try:
-                transcript = transcript_list.find_generated_transcript([lang])
-                break
-            except Exception:
-                pass
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
-    if transcript is None:
-        transcript = next(iter(transcript_list), None)
-        if transcript is None:
-            raise RuntimeError("No transcripts available")
+                preferred_langs = ["zh-Hant", "zh-TW", "zh-HK", "zh", "zh-Hans", "en"]
+                transcript = None
 
-    data = transcript.fetch()
+                for lang in preferred_langs:
+                    try:
+                        transcript = transcript_list.find_manually_created_transcript([lang])
+                        break
+                    except Exception:
+                        pass
 
-    lines = []
-    for item in data:
-        t = (item.get("text") or "").strip()
-        if t:
-            lines.append(t)
+                if transcript is None:
+                    for lang in preferred_langs:
+                        try:
+                            transcript = transcript_list.find_generated_transcript([lang])
+                            break
+                        except Exception:
+                            pass
 
-    return "\n".join(lines)
+                if transcript is None:
+                    transcript = next(iter(transcript_list), None)
+                    if transcript is None:
+                        raise RuntimeError("No transcripts available")
+
+                data = transcript.fetch()
+
+                lines = []
+                for item in data:
+                    t = (item.get("text") or "").strip()
+                    if t:
+                        lines.append(t)
+                text = "\n".join(lines)
+
+                # cache store
+                TRANSCRIPT_CACHE[video_id] = (time.time(), text)
+                return text
+
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+
+                # 判斷是否是 YouTube/Google 限流類型（429 / sorry / too many requests）
+                is_rate_limited = (
+                    "too many requests" in err_str
+                    or "google.com/sorry" in err_str
+                    or "429" in err_str
+                )
+
+                # 不是限流：就不要一直重試（例如影片沒字幕、被關閉）
+                if not is_rate_limited and attempt >= 2:
+                    break
+
+                # backoff with jitter
+                sleep_s = min(60.0, base_sleep * (2 ** (attempt - 1)))
+                sleep_s = sleep_s * (0.7 + random.random() * 0.6)  # 0.7~1.3x
+                print(f"[yt_transcript] attempt {attempt}/{max_attempts} failed; sleep {sleep_s:.1f}s; err={e}")
+                time.sleep(sleep_s)
+
+        raise last_err if last_err else RuntimeError("Transcript fetch failed")
+
 
 
 
@@ -349,6 +415,31 @@ def line_push(user_id: str, text: str) -> None:
     payload = {"to": user_id, "messages": [{"type": "text", "text": text[:4900]}]}
     r = requests.post(url, headers=headers, json=payload, timeout=30)
     r.raise_for_status()
+
+def _worker_loop(worker_id: int) -> None:
+    print(f"[worker-{worker_id}] started")
+    while True:
+        event = JOB_QUEUE.get()  # 會阻塞等待
+        try:
+            process_event(event)
+        except Exception:
+            log_error(f"worker_loop_{worker_id}", traceback.format_exc())
+        finally:
+            JOB_QUEUE.task_done()
+
+
+def ensure_workers_started() -> None:
+    global WORKERS_STARTED
+    if WORKERS_STARTED:
+        return
+    with WORKERS_LOCK:
+        if WORKERS_STARTED:
+            return
+        for wid in range(1, WORKER_COUNT + 1):
+            t = threading.Thread(target=_worker_loop, args=(wid,), daemon=True)
+            t.start()
+        WORKERS_STARTED = True
+        print(f"[queue] workers started: {WORKER_COUNT}")
 
 
 # -----------------------------
@@ -467,7 +558,6 @@ def process_event(event: dict) -> None:
 def healthz():
     return "OK", 200
 
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     raw_body = request.get_data()  # bytes
@@ -481,6 +571,8 @@ def webhook():
         abort(400)
 
     try:
+        ensure_workers_started()
+
         events = body.get("events", []) or []
         for event in events:
             if event.get("type") != "message":
@@ -489,7 +581,18 @@ def webhook():
             if msg.get("type") != "text":
                 continue
 
-            threading.Thread(target=process_event, args=(event,), daemon=True).start()
+            try:
+                JOB_QUEUE.put_nowait(event)
+                print(f"[queue] enqueued event; qsize={JOB_QUEUE.qsize()}")
+            except queue.Full:
+                # Queue 滿了：短時間塞太多
+                reply_token = event.get("replyToken", "") or ""
+                if reply_token:
+                    try:
+                        line_reply(reply_token, "目前同時處理的請求較多，請稍後再試一次 🙏")
+                    except Exception:
+                        log_error("line_reply_queue_full", traceback.format_exc())
+                print("[queue] queue full; dropped event")
 
         return "OK", 200
 
