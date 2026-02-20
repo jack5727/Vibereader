@@ -217,16 +217,11 @@ def extract_video_id(url: str) -> str:
 
 
 def fetch_cc_transcript_text(video_id: str) -> str:
-    """
-    Most compatible approach: get_transcript
-    """
-    # Prefer zh-Hant -> zh -> en
     data = YouTubeTranscriptApi.get_transcript(
         video_id,
-        languages=["zh-Hant", "zh-TW", "zh", "en"],
+        languages=["zh-Hant", "zh-TW", "zh-HK", "zh", "zh-Hans", "en"]
     )
-    # data is usually list[dict] with 'text'
-    lines: List[str] = []
+    lines = []
     for item in data:
         t = (item.get("text") or "").strip()
         if t:
